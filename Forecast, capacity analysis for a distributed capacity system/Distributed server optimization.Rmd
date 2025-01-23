@@ -1,0 +1,655 @@
+
+
+
+```{r setup, echo=FALSE,message=FALSE,warning=FALSE}
+library(tidyverse)
+library(dplyr)
+library(lubridate)
+library(readr)
+library(ggplot2)
+library(rmarkdown)
+library(cowplot)
+library(utils)
+library(gtools)
+library(tidyr)
+library(stats)
+library(knitr)
+library(kableExtra)
+library(officedown)
+library(officer)
+library(flextable)
+library(gridExtra)
+library(factoextra)
+library(forecast)
+library(odbc)
+#conn <- dbConnect(odbc(), "THOR PR DSN")
+conn_StarBurst <- dbConnect(odbc(), "Starburst -DV")
+```
+
+
+```{r filters_vNode_optimizer, echo=FALSE,message=FALSE,warning=FALSE}
+
+date_range_query <- c(as.Date("2025-01-13"),as.Date("2025-01-19"))
+#date_range_query1 <- c(as.Date("2024-12-09"))
+date_range_query1 <-seq(from = date_range_query[1], to = date_range_query[2], by = "day")
+date_range_query2 <- gsub('-', '', date_range_query1)
+
+start_date_1<-paste(date_range_query2,collapse=",")
+
+
+```
+
+```{r input files , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+TPEP_mapping<-read_csv("C:/Users/odaialzrigat/OneDrive - NBN Co Limited/root/Desktop/TPEP mapping/TPEP Mapping v2.csv")
+SMTS_CMR_df<-read_csv("C:/Users/odaialzrigat/Downloads/smtsPerfData_5.csv")
+MACD_capacity<-read_csv("C:/Users/odaialzrigat/OneDrive - NBN Co Limited/root/Desktop/MACD balance/MACD capacity.csv")
+
+
+```
+
+
+
+
+```{r CMR SMTS traffic , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+# SMTS CMR data is already AEST
+SMTS_CMR_df <- SMTS_CMR_df %>%
+  mutate(metrics_date = as.POSIXct(ts, origin="1970-01-01")) %>% 
+  rename(
+    macd_id = macd,
+    sat_id = sat,
+    sat_beam_id = beam,
+    sat_beam_ch_id = channel
+  ) %>%
+  select(-ts) 
+
+
+#SMTS_CMR_df$metrics_date <- SMTS_CMR_df$metrics_date + hours(10)
+
+SMTS_CMR_df$Date <- as.Date(format(SMTS_CMR_df$metrics_date, tz = "Australia/Sydney", usetz = TRUE))
+
+SMTS_CMR_df$FL_Traffic_Mbps<-round(SMTS_CMR_df$flbytecount*8/1e6,1)
+# Create the logical_name column by concatenating gw and smts
+
+SMTS_CMR_df$logical_name <- sprintf("g%02d-smts%02d", SMTS_CMR_df$gw, SMTS_CMR_df$smts)
+
+
+# Remove the first 9 columns from the dataframe
+SMTS_CMR_df <- SMTS_CMR_df[ , -(1:9)]
+
+#filter a specific date range
+
+SMTS_CMR_df_filtered <- SMTS_CMR_df %>%
+  filter(Date %in% date_range_query1)
+
+distinct_values <- SMTS_CMR_df %>%
+  select(macd_id, sat_id, sat_beam_id, sat_beam_ch_id) %>%
+  distinct()
+
+vNode_optimizer_merged <- merge(SMTS_CMR_df_filtered, TPEP_mapping, by = c('sat_id', 'sat_beam_id', 'sat_beam_ch_id', 'macd_id'))
+
+
+
+```
+
+
+```{r Access channels BH charts , echo=FALSE, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+
+SMTS_CMR_df_agg_1 <- SMTS_CMR_df_filtered %>% 
+  group_by(sat_id, sat_beam_id, sat_beam_ch_id, macd_id) %>% 
+  summarise(
+    Max_FL_Traffic_Mbps = round(max(FL_Traffic_Mbps, na.rm = TRUE), 1),  # Ignore NA values
+    metrics_date = metrics_date[which.max(FL_Traffic_Mbps)]
+  )
+
+distinct_df <- SMTS_CMR_df_agg_1 %>%
+  select(metrics_date, sat_id,sat_beam_id,sat_beam_ch_id,macd_id, Max_FL_Traffic_Mbps) %>%
+  distinct() %>%
+  mutate(
+    time = format(metrics_date, "%H:%M"),                  # Extract hour and minute as "HH:MM"
+    Max_FL_Traffic_Mbps = Max_FL_Traffic_Mbps / 1000  # Convert Mbps to Gbps
+  )
+
+# access channels Traffi in Gbps for each time
+traffic_sum_df <- distinct_df %>%
+  group_by(time) %>%
+  summarize(sum_MACDs_max_FL_Traffic_Gbps = sum(Max_FL_Traffic_Mbps, na.rm = TRUE))
+
+# Calculate the total sum of access channels Traffic in Gbps across all timestamps
+total_sum_gbps <- sum(distinct_df$Max_FL_Traffic_Mbps)  # Convert Mbps to Gbps, na.rm = TRUE)
+
+ggplot(traffic_sum_df, aes(x = time, y = sum_MACDs_max_FL_Traffic_Gbps)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = round(sum_MACDs_max_FL_Traffic_Gbps, 1)), vjust = -0.3, size = 3) +  # Add data labels above bars
+  scale_y_continuous(limits = c(0, 10), breaks = seq(0, 10, by = 2)) +  # Set y-axis limits and breaks
+  labs(
+    x = "Hour and Minute",
+    y = "DL Traffic (Gbps)",
+    title = paste("Channels BH Distribution (Total:", round(total_sum_gbps, 1), "Gbps)")
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 12, face = "bold", angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12, face = "bold"),                        
+    axis.title.x = element_text(size = 14, face = "bold"),                       
+    axis.title.y = element_text(size = 14, face = "bold")                       
+  )
+
+```
+
+
+
+```{r Server BH traffic calculation , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+vNode_agg<-vNode_optimizer_merged %>% 
+  group_by(Cluster,Vnode,metrics_date) %>% 
+  summarise(Sum_FL_Traffic_Mbps=sum(FL_Traffic_Mbps))
+
+
+vNode_agg_BH <- vNode_agg %>%
+  group_by(Cluster, Vnode) %>%
+  summarise(
+    Vnode_max_FL_Traffic = round(max(Sum_FL_Traffic_Mbps, na.rm = TRUE),1),
+    Vnode_max_metrics_date = metrics_date[which.max(Sum_FL_Traffic_Mbps)],
+    Vnode_avg_top3_FL_Traffic = round(mean(sort(Sum_FL_Traffic_Mbps, decreasing = TRUE)[1:3], na.rm = TRUE),1)
+  ) %>% 
+  mutate (Vnode_max_hour=hour(Vnode_max_metrics_date))
+
+
+vNode_agg_BH <- vNode_agg_BH %>%
+  rename(metrics_date=Vnode_max_metrics_date )
+
+prior_to_final_merge<-merge(TPEP_mapping,vNode_agg_BH,by=c('Cluster','Vnode'),all.x = TRUE)
+
+
+final_file <- merge(vNode_optimizer_merged, prior_to_final_merge, by=c('metrics_date','sat_id','sat_beam_id','sat_beam_ch_id','macd_id'))
+
+#write.csv(prior_to_final_merge,"C:/Users/odaialzrigat/Downloads/prior_to_final_merge.csv",row.names=FALSE)
+
+final_file2 <- final_file %>%
+  select(sat_id, sat_beam_id, sat_beam_ch_id, macd_id, everything())
+
+final_file2 <- final_file2[ , -c(9:14, 20)]
+
+final_file2<-merge(final_file2,MACD_capacity,by=c('sat_id','sat_beam_id','sat_beam_ch_id','macd_id'))
+
+final_file2 <- final_file2[ , -c(11,17:23)]
+
+# current_datetime <- format(Sys.time(), "%Y-%m-%d_%H-%M")
+# 
+# file_name <- paste0("C:/Users/odaialzrigat/OneDrive - NBN Co Limited/root/Desktop/vNode Optimizer/vNode_optimizer_", current_datetime, ".csv")
+# 
+# write.csv(final_file2, file_name, row.names = FALSE)
+
+
+```
+
+
+
+```{r Server BH charts , echo=FALSE, fig.height=6, fig.width=12, message=FALSE, warning=FALSE}
+
+distinct_df <- final_file2 %>%
+  select(metrics_date, cvv.y, Vnode_max_FL_Traffic) %>%
+  distinct() %>%
+  mutate(
+    time = format(metrics_date, "%H:%M"),                  # Extract hour and minute as "HH:MM"
+    Vnode_max_FL_Traffic_Gbps = Vnode_max_FL_Traffic / 1000  # Convert Mbps to Gbps
+  )
+
+# Step 2: Sum Vnode_max_FL_Traffic in Gbps for each time
+traffic_sum_df <- distinct_df %>%
+  group_by(time) %>%
+  summarize(sum_Vnode_max_FL_Traffic_Gbps = sum(Vnode_max_FL_Traffic_Gbps, na.rm = TRUE))
+
+# Step 3: Calculate the total sum of Vnode_max_FL_Traffic in Gbps across all metrics_date
+total_sum_gbps <- sum(distinct_df$Vnode_max_FL_Traffic_Gbps, na.rm = TRUE)
+
+# Step 4: Plot the bar chart with hour and minute on the x-axis and summed traffic on the y-axis
+ggplot(traffic_sum_df, aes(x = time, y = sum_Vnode_max_FL_Traffic_Gbps)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_text(aes(label = round(sum_Vnode_max_FL_Traffic_Gbps, 1)), vjust = -0.3, size = 3) +  # Add data labels above bars
+  scale_y_continuous(breaks = seq(0, max(traffic_sum_df$sum_Vnode_max_FL_Traffic_Gbps), by = 2)) +  # More y-axis values
+  labs(
+    x = "Hour and Minute",
+    y = "DL Traffic (Gbps)",
+    title = paste("Servers BH Disribution (Total:", round(total_sum_gbps, 1), "Gbps)")
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(size = 12, face = "bold", angle = 45, hjust = 1), 
+    axis.text.y = element_text(size = 12, face = "bold"),                        
+    axis.title.x = element_text(size = 14, face = "bold"),                      
+    axis.title.y = element_text(size = 14, face = "bold")                       
+  )
+
+
+```
+
+
+
+## ) Bin packing preperation
+
+```{r Bin Packing preperation , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+#apply traffic forecast to access channels
+#assign a tag to distinguish channels pairs
+
+tolerance <- 1 #
+
+Bin_Packing_df <- final_file2 %>%
+  mutate(FL_Traffic_Mbps = ceiling(pmin(FL_Traffic_Mbps * 1, MACD_capacity_Mbps)),
+         ceiled_by_MACD = abs(FL_Traffic_Mbps - MACD_capacity_Mbps) < tolerance)
+
+#sum(Bin_Packing_df$FL_Traffic_Mbps)
+
+# Create a summary dataframe counting how many rows were ceiled by MACD_capacity_Mbps
+# summary_df <- Bin_Packing_df %>%
+#   group_by(LAG.y) %>%
+#   summarise(ceiled_count = sum(ceiled_by_MACD))
+
+# Step 1: Set up global counters
+global_counters <- list(pair_counter = 0, standalone_counter = 0)
+
+# Step 2: Define function to tag pairs and standalone
+tag_pairs_and_standalone <- function(df, counters) {
+  tags <- c()  # to hold tags
+  
+  # Check for pairs
+  for (i in seq(1, 8, by = 2)) {
+    has_first <- any(df$macd_id == i)
+    has_second <- any(df$macd_id == (i + 1))
+    
+    if (has_first && has_second) {
+      # Assign pair tags
+      counters$pair_counter <- counters$pair_counter + 1
+      pair_tag <- paste0("pair_", counters$pair_counter)
+      tags[df$macd_id == i | df$macd_id == (i + 1)] <- pair_tag
+    } else if (has_first || has_second) {
+      # Assign standalone tags
+      counters$standalone_counter <- counters$standalone_counter + 1
+      standalone_tag <- paste0("standalone_", counters$standalone_counter)
+      tags[df$macd_id == i | df$macd_id == (i + 1)] <- standalone_tag
+    }
+  }
+  
+  df$tag <- tags
+  return(df)
+}
+
+# Step 3: Apply the function to each logical_name and store in a new dataframe
+Bin_Packing_df_extra <- Bin_Packing_df %>%
+  group_by(logical_name) %>%
+  do(tag_pairs_and_standalone(., global_counters)) %>%
+  ungroup()
+
+# Step 4: Aggregate the traffic by logical_name and tag, add macd_id and LAG.y columns
+Bin_Packing_df_extra_agg <- Bin_Packing_df_extra %>%
+  group_by(logical_name, tag) %>%
+  summarize(
+    agg_DL_Mbps = sum(FL_Traffic_Mbps),
+    macd_ids = paste(unique(macd_id), collapse = ","),
+    LAG_y = first(LAG.y),# Assuming LAG.y is consistent for each logical_name
+    cvv_y = first(cvv.y)
+  )
+
+# Step 5: Add a column for the channel, combining logical_name and tag
+Bin_Packing_df_extra_agg <- Bin_Packing_df_extra_agg %>%
+  mutate(channel = paste(logical_name, tag, sep = "-"))
+
+
+
+```
+
+
+```{r even-distribution of utilization | Abstract servers for scenarios , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+
+
+#Move vNodes across LAGs in the same cluster | running different scenarios
+
+Bin_Packing_df_extra_agg_filtered <- Bin_Packing_df_extra_agg %>%
+  filter(str_starts(as.character(cvv_y), "5"))
+
+
+#Least Load Balancing Logic
+
+even_distribution_utilization <- function(channels_df) {
+  # Split channels based on LAG_y values
+  lag1_channels <- channels_df[channels_df$LAG_y == 1, ]
+  lag2_channels <- channels_df[channels_df$LAG_y == 2, ]
+  
+  # Sort channels by agg_DL_Mbps in descending order (Greedy Load Balancing)
+  lag1_channels <- lag1_channels[order(-lag1_channels$agg_DL_Mbps), ]
+  lag2_channels <- lag2_channels[order(-lag2_channels$agg_DL_Mbps), ]
+  
+  # Define fixed number of servers for LAG 1 and LAG 2
+  lag1_servers <- 1:50  # LAG 1 servers (1 to xxx)
+  lag2_servers <- 1:50  # LAG 2 servers (1 to xxx)
+  
+  # Initialize the server load trackers based on the fixed number of servers
+  lag1_loads <- setNames(rep(0, length(lag1_servers)), lag1_servers)  # LAG 1 server load tracker
+  lag2_loads <- setNames(rep(0, length(lag2_servers)), lag2_servers)  # LAG 2 server load tracker
+  
+  # Function to assign channels to the server with the least load
+  assign_channels_to_servers <- function(channels, server_loads) {
+    server_assignment <- rep(NA, nrow(channels))
+    
+    # Iterate over the sorted channels
+    for (i in 1:nrow(channels)) {
+      # Get the current channel's throughput
+      current_channel_throughput <- channels$agg_DL_Mbps[i]
+      
+      # Find the server with the least load
+      min_load_server <- names(which.min(server_loads))  # Get the server with the least load
+      
+      # Assign the channel to that server
+      server_assignment[i] <- min_load_server
+      server_loads[min_load_server] <- server_loads[min_load_server] + current_channel_throughput
+    }
+    
+    return(list(server_assignment = server_assignment, server_loads = server_loads))
+  }
+  
+  # Assign channels in LAG 1 using least load balancing logic
+  lag1_result <- assign_channels_to_servers(lag1_channels, lag1_loads)
+  lag1_channels$cvv_y <- lag1_result$server_assignment
+  
+  # Assign channels in LAG 2 using least load balancing logic
+  lag2_result <- assign_channels_to_servers(lag2_channels, lag2_loads)
+  lag2_channels$cvv_y <- lag2_result$server_assignment
+  
+  # Combine the two dataframes back together
+  result <- rbind(lag1_channels, lag2_channels)
+  
+  # Return the updated dataframe with server assignments
+  return(result)
+}
+
+# Apply the load balancing function
+result <- even_distribution_utilization(Bin_Packing_df_extra_agg)
+
+
+
+# current_datetime <- format(Sys.time(), "%Y-%m-%d_%H-%M")
+# file_name <- paste0("C:/Users/odaialzrigat/Downloads/vNode_optimization_result_", current_datetime, ".csv")
+# write.csv(result, file_name, row.names = FALSE)
+
+
+```
+
+
+
+```{r even-distribution of utilization plots , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+
+# Summarize agg_DL_Mbps by cvv_y and LAG_y
+agg_summary <- result %>%
+  group_by(LAG_y, cvv_y) %>%
+  summarise(total_agg_DL_Mbps = round(sum(agg_DL_Mbps),1)) %>%
+  ungroup()
+
+#write.csv(agg_summary,"C:/Users/odaialzrigat/Downloads/agg_summary.csv",row.names=FALSE)
+
+# Sort the summarized data by total_agg_DL_Mbps for each LAG_y
+agg_summary_lag1 <- agg_summary %>% filter(LAG_y == 1) %>% arrange(total_agg_DL_Mbps)
+agg_summary_lag2 <- agg_summary %>% filter(LAG_y == 2) %>% arrange(total_agg_DL_Mbps)
+
+
+# Calculate the maximum value of total_agg_DL_Mbps across both lag1 and lag2
+max_agg_dl_mbps_LAG1 <- max(agg_summary_lag1$total_agg_DL_Mbps)
+max_agg_dl_mbps_LAG2 <- max(agg_summary_lag2$total_agg_DL_Mbps)
+
+# Define the color palette
+color_palette <- scales::gradient_n_pal(c("lightblue", "blue"))(seq(0, 1, length.out = nrow(agg_summary_lag1)))
+color_palette_lag2 <- scales::gradient_n_pal(c("lightyellow", "yellow"))(seq(0, 1, length.out = nrow(agg_summary_lag2)))
+
+# Plot for LAG 1
+plot_lag1 <- ggplot(agg_summary_lag1, aes(x = reorder(factor(cvv_y), total_agg_DL_Mbps), y = total_agg_DL_Mbps)) +
+  geom_bar(stat = "identity", aes(fill = total_agg_DL_Mbps), width = 0.6, color = "black") +
+  geom_hline(yintercept = 1000, color = "red", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = max_agg_dl_mbps_LAG1, color = "orange", linetype = "dashed", size = 1) + # Set orange line dynamically
+  scale_fill_gradientn(colors = color_palette) +
+  labs(title = "LAG 1 Servers Load distribution", x = "Servers", y = "Total agg_DL_Mbps") +
+  scale_y_continuous(limits = c(0, 1000), breaks = seq(0, 1000, by = 50)) +  
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 16), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# Plot for LAG 2
+plot_lag2 <- ggplot(agg_summary_lag2, aes(x = reorder(factor(cvv_y), total_agg_DL_Mbps), y = total_agg_DL_Mbps)) +
+  geom_bar(stat = "identity", aes(fill = total_agg_DL_Mbps), width = 0.6, color = "black") +
+  geom_hline(yintercept = 1000, color = "red", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = max_agg_dl_mbps_LAG2, color = "orange", linetype = "dashed", size = 1) + # Set orange line dynamically
+  scale_fill_gradientn(colors = color_palette_lag2) +
+  labs(title = "LAG 2 Servers Load distribution", x = "Servers", y = "Total agg_DL_Mbps") +
+  scale_y_continuous(limits = c(0, 1000), breaks = seq(0, 1000, by = 50)) + 
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 16), 
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+
+grid.arrange(plot_lag1, plot_lag2, ncol = 2)
+
+
+
+```
+
+
+
+
+
+
+
+
+```{r filters for traffic forecast, echo=FALSE,message=FALSE,warning=FALSE}
+
+date_range_query1 <- as.Date("2024-08-01")
+date_range_query1 <- gsub('-', '', date_range_query1)
+
+start_date_1<-paste(date_range_query1,collapse=",")
+
+
+date_range_query2 <- as.Date("2024-12-01")
+date_range_query2 <- gsub('-', '', date_range_query2)
+start_date_2<-paste(date_range_query2,collapse=",")
+
+```
+
+
+
+```{r Network traffic , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+Network_Gbps_sql_query <- paste0("with avc_enr as (
+  select dt, avc_id, ntd_id, cvc_id, logical_name, sat_beam_id, sat_id, sat_beam_ch_id, macd_id, tc4_bandwidth_profile
+  from hive.thor_satellite.v_satellite_thor_avc_enrichment
+  where dt between (",start_date_1,") and (",start_date_2,") -- and (dt not between 20240912 and 20240922)
+)
+select 
+  a.dt,
+  a.metrics_date,
+  ROUND(SUM(CASE 
+                  WHEN a.tc4_bandwidth_profile LIKE 'D50%' 
+                       OR a.tc4_bandwidth_profile LIKE 'D100%' 
+                       OR (a.tc4_bandwidth_profile LIKE 'D25%' AND a.access_seeker_name = 'Sky Muster MSP') 
+                  THEN a.downstream_avg_bytes_per_sec 
+                  ELSE 0 
+             END) / 1e9 * 8, 1) AS SMP_FL_Traffic_Gbps,
+  ROUND(SUM(CASE 
+                  WHEN a.tc4_bandwidth_profile NOT LIKE 'D50%' 
+                       AND a.tc4_bandwidth_profile NOT LIKE 'D100%' 
+                       AND NOT (a.tc4_bandwidth_profile LIKE 'D25%' AND a.access_seeker_name = 'Sky Muster MSP')
+                  THEN a.downstream_avg_bytes_per_sec 
+                  ELSE 0 
+             END) / 1e9 * 8, 1) AS SM_FL_Traffic_Gbps,
+  COUNT(DISTINCT a.avc_id) AS AVC_count,
+  COUNT(DISTINCT CASE 
+                  WHEN a.tc4_bandwidth_profile LIKE 'D50%' 
+                       OR a.tc4_bandwidth_profile LIKE 'D100%' 
+                       OR (a.tc4_bandwidth_profile LIKE 'D25%' AND a.access_seeker_name = 'Sky Muster MSP') 
+                  THEN a.avc_id 
+                END) AS SMP_AVC,
+  COUNT(DISTINCT CASE 
+                  WHEN a.tc4_bandwidth_profile NOT LIKE 'D50%' 
+                       AND a.tc4_bandwidth_profile NOT LIKE 'D100%' 
+                       AND NOT (a.tc4_bandwidth_profile LIKE 'D25%' AND a.access_seeker_name = 'Sky Muster MSP') 
+                  THEN a.avc_id 
+                END) AS SM_AVC
+from hive.thor_agg.v_agg_thor_avc_octets_traffic_class_summary a
+join avc_enr b on a.avc_id = b.avc_id and a.dt = b.dt
+where a.dt between (",start_date_1,") and (",start_date_2,")-- and (a.dt not between 20240912 and 20240922)
+and a.access_service_tech_type = 'Satellite'
+group by a.dt, a.metrics_date
+order by a.dt, a.metrics_date")
+
+Network_Gbps_sql_query <- format(Network_Gbps_sql_query, width = 80)
+
+#MACD_FL_Mbps_BH <- dbGetQuery(conn, MACD_FL_Mbps_BH_sql_query)
+Network_Gbps <- dbGetQuery(conn_StarBurst, Network_Gbps_sql_query)
+
+Network_Gbps$metrics_date <- Network_Gbps$metrics_date + hours(10)
+
+Network_Gbps$hour<- hour(Network_Gbps$metrics_date)
+Network_Gbps$Date <- as.Date(Network_Gbps$metrics_date)
+
+Network_Gbps<-Network_Gbps %>% 
+  filter(Date != as.Date("2024-09-12"))
+
+```
+
+
+```{r Network agg , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+
+NW_agg_1<-Network_Gbps %>% 
+  group_by(Date) %>%
+  summarise(Max_Daily_SMP_DL_Thrp=max(SMP_FL_Traffic_Gbps),Max_Daily_SM_DL_Thrp=max(SM_FL_Traffic_Gbps),SMP_SIO_Count=max(SMP_AVC),SM_SIO_Count=max(SM_AVC)) %>%
+  ungroup() %>%
+  filter(Date != max(Date))
+
+NW_agg_1<-NW_agg_1 %>% 
+   mutate(Max_Daily_DL_Thrp=Max_Daily_SMP_DL_Thrp+Max_Daily_SM_DL_Thrp)
+
+NW_agg_1 <- NW_agg_1 %>%
+  filter(!is.na(Max_Daily_SMP_DL_Thrp))
+
+NW_agg_1 <- NW_agg_1 %>%
+  mutate(SMP_SIO_Count = as.double(SMP_SIO_Count),SM_SIO_Count = as.double(SM_SIO_Count))
+
+
+
+# Function to aggressively remove outliers using a tighter IQR multiplier and optional trimming
+remove_outliers_aggressive <- function(x, multiplier = 0.5, trim_percent = 0.05) {
+  # Step 1: Use the IQR method with a tighter multiplier
+  Q1 <- quantile(x, 0.25)
+  Q3 <- quantile(x, 0.75)
+  IQR_value <- Q3 - Q1
+  lower_bound <- Q1 - multiplier * IQR_value
+  upper_bound <- Q3 + multiplier * IQR_value
+  x_filtered <- x[x >= lower_bound & x <= upper_bound]
+  
+  # Step 2: Trim the top and bottom percentages of the filtered data (optional)
+  x_trimmed <- sort(x_filtered)
+  trim_amount <- floor(trim_percent * length(x_trimmed))
+  x_final <- x_trimmed[(trim_amount + 1):(length(x_trimmed) - trim_amount)]
+  
+  return(x_final)
+}
+
+# Remove outliers from SMP_SIO_Count more aggressively (with additional trimming)
+filtered_smp_count <- remove_outliers_aggressive(NW_agg_1$SMP_SIO_Count, multiplier = 0.5, trim_percent = 0.10)
+
+# Filter the dataframe for the aggressive outlier removal
+NW_agg_1_filtered <- NW_agg_1 %>%
+  filter(SMP_SIO_Count %in% filtered_smp_count)
+
+
+#write.csv(NW_agg_1_filtered,"C:/Users/odaialzrigat/Downloads/NW_agg_1_filtered.csv",row.names=FALSE)
+
+```
+
+
+
+```{r Network level forecast , echo=FALSE, fig.height=7, fig.width=13, message=FALSE, warning=FALSE}
+
+ts_smp <- ts(NW_agg_1_filtered$SMP_SIO_Count, frequency = 7)  # Assuming weekly seasonality
+ts_sm <- ts(NW_agg_1$SM_SIO_Count, frequency = 7)             # SM_SIO_Count data remains unchanged
+
+# Fit ARIMA models
+arima_model_smp <- auto.arima(ts_smp, stepwise = FALSE)
+arima_model_sm <- auto.arima(ts_sm, stepwise = FALSE)
+
+# Forecast for the next 365 days
+forecast_smp <- forecast(arima_model_smp, h = 730)
+forecast_sm <- forecast(arima_model_sm, h = 730)
+
+# Create future dates
+future_dates <- seq(max(NW_agg_1$Date) + 1, by = "day", length.out = 730)
+
+# Create forecast data frames
+forecast_df_smp <- data.frame(
+  Date = future_dates,
+  Forecast = as.numeric(forecast_smp$mean),
+  Lower_80 = as.numeric(forecast_smp$lower[, 1]),
+  Upper_80 = as.numeric(forecast_smp$upper[, 1]),
+  Lower_95 = as.numeric(forecast_smp$lower[, 2]),
+  Upper_95 = as.numeric(forecast_smp$upper[, 2])
+)
+
+forecast_df_sm <- data.frame(
+  Date = future_dates,
+  Forecast = as.numeric(forecast_sm$mean),
+  Lower_80 = as.numeric(forecast_sm$lower[, 1]),
+  Upper_80 = as.numeric(forecast_sm$upper[, 1]),
+  Lower_95 = as.numeric(forecast_sm$lower[, 2]),
+  Upper_95 = as.numeric(forecast_sm$upper[, 2])
+)
+
+# Plot the actual and forecast data with LOESS regression, more y-axis values, and vertical x-axis
+p <- ggplot() +
+  # SMP_SIO_Count actual data (after more aggressive outlier removal)
+  geom_point(data = NW_agg_1_filtered, aes(x = Date, y = SMP_SIO_Count, color = "SMP_SIO_Count"), size = 2) +
+  geom_smooth(data = NW_agg_1_filtered, aes(x = Date, y = SMP_SIO_Count, color = "SMP_SIO_Count"), method = "loess", span = 0.3, se = FALSE, size = 1) +
+  geom_line(data = forecast_df_smp, aes(x = Date, y = Forecast, color = "SMP_SIO_Count"), linetype = "dashed") +
+  geom_ribbon(data = forecast_df_smp, aes(x = Date, ymin = Lower_95, ymax = Upper_95, fill = "SMP_SIO_Count"), alpha = 0.2) +
+  geom_ribbon(data = forecast_df_smp, aes(x = Date, ymin = Lower_80, ymax = Upper_80, fill = "SMP_SIO_Count"), alpha = 0.4) +
+
+  # SM_SIO_Count actual data
+  geom_point(data = NW_agg_1, aes(x = Date, y = SM_SIO_Count, color = "SM_SIO_Count"), size = 2) +
+  geom_smooth(data = NW_agg_1, aes(x = Date, y = SM_SIO_Count, color = "SM_SIO_Count"), method = "loess", span = 0.3, se = FALSE, size = 1) +
+  geom_line(data = forecast_df_sm, aes(x = Date, y = Forecast, color = "SM_SIO_Count"), linetype = "dashed") +
+  geom_ribbon(data = forecast_df_sm, aes(x = Date, ymin = Lower_95, ymax = Upper_95, fill = "SM_SIO_Count"), alpha = 0.2) +
+  geom_ribbon(data = forecast_df_sm, aes(x = Date, ymin = Lower_80, ymax = Upper_80, fill = "SM_SIO_Count"), alpha = 0.4) +
+
+  # Axis and labels
+  labs(title = "Customers Forecast LOESS Regression + ARIMA",
+       x = "Date", 
+       y = "SIO Count") +
+  theme_minimal() +
+  
+  # X-axis adjustments
+  scale_x_date(date_breaks = "1 month", date_labels = "%Y-%m") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Vertical x-axis
+  
+  # Y-axis adjustments
+  scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +  # More y-axis values
+  
+  # Color and fill settings
+  scale_color_manual(values = c("SMP_SIO_Count" = "blue", "SM_SIO_Count" = "orange")) +
+  scale_fill_manual(values = c("SMP_SIO_Count" = "green", "SM_SIO_Count" = "magenta"))
+
+# Display the plot
+print(p)
+
+
+```
+
+
+
+
+
+
+
+
